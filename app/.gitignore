@@ -1,0 +1,16 @@
+models/
+sample_*.wav
+*.wav
+!ref_audio.wav
+!ref_audio_2.wav
+!ref_audio_3.wav
+!samples/**/*.wav
+*.json
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.cache/
+outputs/
+artifacts/
+packages/qwentts_cpp_python/

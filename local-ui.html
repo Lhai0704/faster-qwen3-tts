@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>本地声音克隆 · Qwen3</title>
+<style>
+body{font:16px/1.7 system-ui;margin:40px auto;padding:0 24px;max-width:800px;background:#f5f6f8;color:#172335}
+h1{font-size:28px}
+label{display:block;margin:22px 0 8px;font-weight:600}
+textarea,select{box-sizing:border-box;width:100%;padding:12px;border:1px solid #ccd4df;border-radius:8px;font:inherit}
+button,a{display:inline-block;margin-top:20px;padding:12px 20px;background:#2456c6;color:white;border:0;border-radius:8px;font:inherit;text-decoration:none}
+button{cursor:pointer}
+button.secondary{background:#e4eafb;color:#224785;margin-left:8px}
+button:disabled{opacity:.5;cursor:wait}
+small{color:#59687b}
+audio{width:100%;margin-top:20px}
+#status,#model-state{white-space:pre-wrap}
+#model-state{margin:12px 0 0;color:#59687b;font-size:14px}
+.actions{display:flex;flex-wrap:wrap;gap:0}
+[hidden]{display:none}
+@media(max-width:640px){button.secondary{margin-left:0}}
+</style>
+<h1>本地声音克隆 <small>0.6B / 1.7B</small></h1>
+<p>参考录音与生成过程都留在这台电脑上。生成的 WAV 保存在本程序的 generated 文件夹。</p>
+<label for="model">生成模型</label>
+<select id="model">
+  <option value="0.6B">0.6B Base</option>
+  <option value="1.7B">1.7B Base</option>
+</select>
+<p id="model-state">正在读取模型状态…</p>
+<div class="actions">
+  <button id="load" class="secondary" type="button">加载所选模型</button>
+  <button id="unload" class="secondary" type="button">卸载模型</button>
+</div>
+<label for="ref">声音模板</label>
+<select id="ref"></select>
+<label for="text">要朗读的中文</label>
+<textarea id="text" rows="5" maxlength="500"></textarea>
+<label for="transcript">模板录音的准确文字（选填）</label>
+<textarea id="transcript" rows="3" placeholder="填写后启用完整参考模式。这里必须是模板录音的原文，不是要生成的文字。"></textarea>
+<small>留空使用音色参考模式。加载或切换模型会占用显存；不用时可以先卸载模型。彻底关闭请使用 stop.cmd / stop.bat。</small><br>
+<button id="go">生成声音</button>
+<p id="status" role="status">正在连接本地服务…</p>
+<audio id="player" controls hidden></audio>
+<a id="download" hidden>下载 WAV</a>
+<script>
+const $=id=>document.getElementById(id);
+const fields=['model','ref','text','transcript'];
+function inputs(){return {text:$('text').value,reference:$('ref').value,ref_text:$('transcript').value,model:$('model').value};}
+function remember(){localStorage.setItem('qwen-local-inputs',JSON.stringify(inputs()));}
+function showAudio(s){
+  $('player').src=s.url;$('player').hidden=false;
+  $('download').href=s.url;$('download').download=s.file;$('download').hidden=false;
+}
+function gpuText(s){
+  if(!s.gpu)return '';
+  return `显存约 ${s.gpu.used_mb} / ${s.gpu.total_mb} MiB（进程预留 ${s.gpu.reserved_mb} MiB）`;
+}
+function renderModel(s){
+  const loaded=s.active_model?`当前已加载 ${s.active_model}`:'当前未加载模型';
+  $('model-state').textContent=loaded+(s.gpu?` · ${gpuText(s)}`:'');
+  $('unload').disabled=!s.active_model;
+}
+function busy(on){
+  $('go').disabled=on;$('load').disabled=on;$('unload').disabled=on;
+  for(const id of fields)$(id).disabled=on;
+}
+async function refreshStatus(){
+  const s=await fetch('/status').then(r=>r.json());
+  renderModel(s);
+  return s;
+}
+function post(path,body){
+  return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(async r=>{
+    const s=await r.json();
+    if(!r.ok)throw Error(s.error||r.statusText);
+    return s;
+  });
+}
+fetch('/status').then(r=>r.json()).then(s=>{
+  for(const name of s.references){const o=document.createElement('option');o.textContent=name;o.value=name;$('ref').appendChild(o);}
+  $('text').value=s.default_text;
+  for(const [key,available] of Object.entries(s.models||{})){
+    const o=[...$('model').options].find(o=>o.value===key);
+    if(!o)continue;
+    o.disabled=!available;
+    if(!available)o.textContent+='（未安装）';
+  }
+  if(s.models && !s.models[$('model').value]){
+    const first=[...$('model').options].find(o=>!o.disabled);
+    if(first)$('model').value=first.value;
+  }
+  renderModel(s);
+  $('status').textContent=s.active_model?'本地服务已连接，模型已在显存中。':'本地服务已连接。可以先加载模型，也可以直接生成（会自动加载）。';
+  if(s.latest){
+    showAudio(s.latest);
+    $('text').value=s.latest.text;
+    if(s.references.includes(s.latest.reference))$('ref').value=s.latest.reference;
+    $('transcript').value=s.latest.ref_text||'';
+    if(s.models && s.models[s.latest.model])$('model').value=s.latest.model;
+    $('status').textContent='已载入最近一次试听 · '+(s.latest.model||'0.6B')+' · '+s.latest.seconds+' 秒。';
+  }
+  try{
+    const draft=JSON.parse(localStorage.getItem('qwen-local-inputs'));
+    if(draft){
+      $('text').value=draft.text||s.default_text;
+      if(s.references.includes(draft.reference))$('ref').value=draft.reference;
+      $('transcript').value=draft.ref_text||'';
+      if(s.models && s.models[draft.model])$('model').value=draft.model;
+    }
+  }catch{}
+}).catch(e=>$('status').textContent='连接失败：'+e.message);
+for(const id of fields)$(id).addEventListener('change',remember);
+$('go').onclick=async()=>{
+  const data=inputs();
+  if(!data.text.trim()){$('status').textContent='请先输入要朗读的文字。';return;}
+  remember();busy(true);
+  $('status').textContent='正在生成 '+data.model+'…加载或切换模型可能需要一段时间。';
+  try{
+    const s=await post('/generate',data);
+    showAudio(s);renderModel(s);
+    $('status').textContent=`完成 · ${s.model} · ${s.mode} · 音频 ${s.seconds} 秒 · 推理 ${s.elapsed} 秒`+(s.total_elapsed!==undefined?` · 含加载共 ${s.total_elapsed} 秒`:'')+(s.model_loaded?'（本次含预热）':'')+`\n${s.file}`;
+  }catch(e){$('status').textContent='生成失败：'+e.message;try{await refreshStatus();}catch{}}
+  finally{busy(false);try{await refreshStatus();}catch{}}
+};
+$('load').onclick=async()=>{
+  remember();busy(true);
+  $('status').textContent='正在加载 '+$('model').value+'…';
+  try{
+    const s=await post('/model',{action:'load',model:$('model').value});
+    renderModel(s);
+    $('status').textContent=s.loaded?`已加载 ${s.active_model}，用时 ${s.elapsed} 秒。`:`${s.active_model} 已在显存中，无需重复加载。`;
+  }catch(e){$('status').textContent='加载失败：'+e.message;}
+  finally{busy(false);try{await refreshStatus();}catch{}}
+};
+$('unload').onclick=async()=>{
+  busy(true);
+  $('status').textContent='正在卸载模型并释放显存…';
+  try{
+    const s=await post('/model',{action:'unload'});
+    renderModel(s);
+    $('status').textContent=s.previous_model?`已卸载 ${s.previous_model}。`:'当前没有已加载的模型。';
+  }catch(e){$('status').textContent='卸载失败：'+e.message;}
+  finally{busy(false);try{await refreshStatus();}catch{}}
+};
+</script>
+</html>

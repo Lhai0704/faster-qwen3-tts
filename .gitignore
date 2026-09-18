@@ -1,12 +1,47 @@
-models/
-sample_*.wav
-*.wav
-!ref_audio.wav
-*.json
-__pycache__/
-*.pyc
+# Local runtime, caches, and downloaded models
 .venv/
 .cache/
+cache/
+runtime/
+tools/
+tmp/
+models/
 outputs/
 artifacts/
-packages/qwentts_cpp_python/
+.commandcode/
+
+# User voice materials and generated audio
+test-voice/
+generated/
+logs/
+backups/
+
+# Machine-specific model snapshot paths
+model-path.txt
+model-path-1.7B.txt
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Media, except upstream reference/sample wavs under app/
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.png
+*.jpg
+*.jpeg
+*.webp
+!app/ref_audio.wav
+!app/ref_audio_2.wav
+!app/ref_audio_3.wav
+!app/samples/**/*.wav
+
+# Generation sidecars and local libraries
+*.json
+
+# Windows
+Thumbs.db
+Desktop.ini
