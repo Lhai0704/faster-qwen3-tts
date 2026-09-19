@@ -5,6 +5,39 @@ from urllib.parse import urlparse, unquote
 from contextlib import contextmanager
 import secrets
 import base64
+
+def watch_deskaide_owner():
+    """An auto-started service belongs to this exact Windows process lifetime.
+
+    Hold an OS process handle (not repeated PID lookups) so PID reuse cannot
+    attach the service to a later process. Manual launches have no owner.
+    Start before heavy model imports, including when the owner exits mid-load.
+    """
+    owner = os.environ.get('DESKAIDE_PARENT_PID')
+    if os.name != 'nt' or not owner:
+        return
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    handle = kernel.OpenProcess(0x00100000, False, int(owner))  # SYNCHRONIZE
+    if not handle:
+        raise RuntimeError('DeskAide owner process is no longer available')
+    def wait():
+        result = kernel.WaitForSingleObject(handle, 0xFFFFFFFF)
+        kernel.CloseHandle(handle)
+        if result == 0:  # WAIT_OBJECT_0; process exit releases all CUDA resources.
+            os._exit(0)
+    threading.Thread(target=wait, daemon=True, name='deskaide-owner').start()
+
+if __name__ == '__main__':
+    watch_deskaide_owner()
+
 from studio import Library, Monitor, settings, DEFAULTS, LANGUAGES, atomic_json
 import numpy as np
 import soundfile as sf
@@ -21,12 +54,39 @@ MODEL = None
 MODEL_KEY = None
 LOCK = threading.Lock()
 SERVER = None
+TASKS = {}
+TASKS_LOCK = threading.Lock()
+CANCELLED_TASKS = {}
+INSTANCE_ID = secrets.token_hex(16)
 DEFAULT_TEXT = '你好，很高兴在这里遇见你。这是一段在本地电脑上生成的声音克隆测试。希望今天的你，也能拥有轻松愉快的好心情。'
 LIBRARY = Library(ROOT)
 MONITOR = Monitor()
 
 class BusyError(Exception):
     pass
+
+class CancelledError(Exception):
+    pass
+
+def check_cancel(cancel):
+    if cancel is not None and cancel.is_set():
+        raise CancelledError('播报已取消')
+
+def cancel_task(task_id):
+    if not isinstance(task_id, str) or not 1 <= len(task_id) <= 128:
+        raise ValueError('Invalid task_id')
+    with TASKS_LOCK:
+        now = time.monotonic()
+        for key in list(CANCELLED_TASKS):
+            if now - CANCELLED_TASKS[key] > 600:
+                del CANCELLED_TASKS[key]
+        if len(CANCELLED_TASKS) >= 1024:
+            del CANCELLED_TASKS[next(iter(CANCELLED_TASKS))]
+        CANCELLED_TASKS[task_id] = now
+        event = TASKS.get(task_id)
+        if event is not None:
+            event.set()
+    return {'ok': True}
 
 @contextmanager
 def operation(phase, kind=None):
@@ -64,7 +124,7 @@ def gpu_stats():
     return {'used_mb': used, 'reserved_mb': reserved, 'allocated_mb': allocated, 'total_mb': total_mb}
 
 def snapshot():
-    return {'ready': MODEL is not None, 'active_model': MODEL_KEY, 'models': {key: (ROOT / filename).is_file() for key, filename in MODEL_PATH_FILES.items()}, **MONITOR.snapshot()}
+    return {'service': 'fast-qwen3-tts', 'api_version': 1, 'instance_id': INSTANCE_ID, 'capabilities': ['temporary_stream', 'cancel_task'], 'ready': MODEL is not None, 'active_model': MODEL_KEY, 'models': {key: (ROOT / filename).is_file() for key, filename in MODEL_PATH_FILES.items()}, **MONITOR.snapshot()}
 
 def _clear_cuda():
     gc.collect()
@@ -149,7 +209,7 @@ def load_model(model_key):
         print(json.dumps({'event': 'load', **result}, ensure_ascii=False), flush=True)
         return result
 
-def generate(text, ref_name, ref_text='', model_key='0.6B', params=None, on_chunk=None):
+def generate(text, ref_name, ref_text='', model_key='0.6B', params=None, on_chunk=None, persist=True, cancel=None):
     if not isinstance(text, str) or not text.strip() or len(text) > 500:
         raise ValueError('请输入 1 到 500 字的文字。长文建议分段生成。')
     if not isinstance(ref_text, str) or len(ref_text) > 5000:
@@ -160,9 +220,11 @@ def generate(text, ref_name, ref_text='', model_key='0.6B', params=None, on_chun
         config['seed'] = secrets.randbelow(2147483648)
     if ref_name not in references():
         raise ValueError('找不到参考音频。')
+    check_cancel(cancel)
     with operation('loading', kind='generate'):
         request_started = time.perf_counter()
         switched = _load_locked(model_key)
+        check_cancel(cancel)
         load_elapsed = round(time.perf_counter() - request_started, 2)
         MONITOR.update(phase='preparing')
         started = time.perf_counter()
@@ -180,17 +242,24 @@ def generate(text, ref_name, ref_text='', model_key='0.6B', params=None, on_chun
         audio, samples, steps = [], 0, 0
         MONITOR.update(phase='encoding')
         for chunk, rate, timing in MODEL.generate_voice_clone_streaming(text=text.strip(), ref_audio=str(prepared), ref_text=ref_text.strip(), chunk_size=12, **kwargs):
+            check_cancel(cancel)
             chunk = np.asarray(chunk, dtype=np.float32).reshape(-1)
             if not np.isfinite(chunk).all():
                 raise RuntimeError('生成的音频无效，请重试。')
             if not chunk.size:
                 continue
-            audio.append(chunk)
+            if persist:
+                audio.append(chunk)
             samples += len(chunk)
             steps = timing.get('total_steps_so_far', steps)
             MONITOR.update(phase='generating', audio_seconds=round(samples / rate, 2), steps=steps)
             if on_chunk:
                 on_chunk(chunk, rate)
+        check_cancel(cancel)
+        if not persist:
+            if not samples:
+                raise RuntimeError('未生成音频，请调整文字或参考素材后重试。')
+            return {'seconds': round(samples / rate, 2), 'sample_rate': rate, 'persisted': False, 'truncated': steps >= config['max_new_tokens']}
         if not audio:
             raise RuntimeError('未生成音频，请调整文字或参考素材后重试。')
         MONITOR.update(phase='saving')
@@ -248,6 +317,8 @@ class Handler(BaseHTTPRequestHandler):
             data = snapshot()
             data.update({'default_text': DEFAULT_TEXT, 'defaults': DEFAULTS, 'languages': LANGUAGES})
             return self.send(200, data)
+        if path == '/references':
+            return self.send(200, {'references': LIBRARY.references()})
         if path == '/library':
             return self.send(200, {'references': LIBRARY.references(), 'history': LIBRARY.history()})
         if path.startswith('/reference/'):
@@ -266,6 +337,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(403, {'error': 'Origin rejected'})
         try:
             data = self.read_json()
+            if path == '/cancel':
+                return self.send(200, cancel_task(data.get('task_id')))
             if path == '/references':
                 return self.send(200, LIBRARY.save_reference(data))
             if path == '/history/delete':
@@ -295,11 +368,30 @@ class Handler(BaseHTTPRequestHandler):
             self.send(500, {'error': str(exc)})
 
     def stream_generate(self, data):
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/x-ndjson; charset=utf-8')
-        self.send_header('Cache-Control', 'no-store')
-        self.send_header('Connection', 'close')
-        self.end_headers()
+        temporary = data.get('persist', True) is False
+        task_id = data.get('task_id')
+        cancel = None
+        if temporary:
+            if not isinstance(task_id, str) or not 1 <= len(task_id) <= 128:
+                raise ValueError('临时播报需要 task_id')
+            cancel = threading.Event()
+            with TASKS_LOCK:
+                if task_id in TASKS:
+                    raise BusyError('task_id 已在使用')
+                if task_id in CANCELLED_TASKS:
+                    cancel.set()
+                TASKS[task_id] = cancel
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/x-ndjson; charset=utf-8')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+        except OSError:
+            if temporary:
+                with TASKS_LOCK:
+                    TASKS.pop(task_id, None)
+            return
         self.close_connection = True
         connected = True
 
@@ -312,27 +404,41 @@ class Handler(BaseHTTPRequestHandler):
                 except OSError:
                     # Finish saving the requested work even if the page closes.
                     connected = False
+                    if cancel is not None:
+                        cancel.set()
 
         def chunk(audio, rate):
+            check_cancel(cancel)
             emit(dict(type='audio', sample_rate=rate,
                       pcm=base64.b64encode(audio.astype('<f4').tobytes()).decode('ascii')))
 
         emit(dict(type='start'))
         try:
+            options = {'persist': False, 'cancel': cancel} if temporary else {}
             result = generate(data.get('text', ''), data.get('reference', ''),
                               data.get('ref_text', ''), data.get('model', '0.6B'),
-                              data.get('settings', {}), on_chunk=chunk)
+                              data.get('settings', {}), on_chunk=chunk, **options)
             emit(dict(type='done', result=result))
+        except CancelledError:
+            emit(dict(type='cancelled'))
         except Exception as exc:
-            if not isinstance(exc, (ValueError, BusyError)):
+            if not temporary and not isinstance(exc, (ValueError, BusyError)):
                 traceback.print_exc()
             emit(dict(type='error', error=str(exc)))
+        finally:
+            if temporary:
+                with TASKS_LOCK:
+                    TASKS.pop(task_id, None)
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
 def write_pid():
+    # Auto-started services are tied to an OS owner handle. Do not leave a stale
+    # PID marker when Windows terminates that process tree without Python cleanup.
+    if os.environ.get('DESKAIDE_PARENT_PID'):
+        return
     PID_FILE.write_text(str(os.getpid()), encoding='utf-8')
 
 def clear_pid():
