@@ -4,6 +4,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, unquote
 from contextlib import contextmanager
 import secrets
+import base64
 from studio import Library, Monitor, settings, DEFAULTS, LANGUAGES, atomic_json
 import numpy as np
 import soundfile as sf
@@ -148,7 +149,7 @@ def load_model(model_key):
         print(json.dumps({'event': 'load', **result}, ensure_ascii=False), flush=True)
         return result
 
-def generate(text, ref_name, ref_text='', model_key='0.6B', params=None):
+def generate(text, ref_name, ref_text='', model_key='0.6B', params=None, on_chunk=None):
     if not isinstance(text, str) or not text.strip() or len(text) > 500:
         raise ValueError('请输入 1 到 500 字的文字。长文建议分段生成。')
     if not isinstance(ref_text, str) or len(ref_text) > 5000:
@@ -179,10 +180,17 @@ def generate(text, ref_name, ref_text='', model_key='0.6B', params=None):
         audio, samples, steps = [], 0, 0
         MONITOR.update(phase='encoding')
         for chunk, rate, timing in MODEL.generate_voice_clone_streaming(text=text.strip(), ref_audio=str(prepared), ref_text=ref_text.strip(), chunk_size=12, **kwargs):
+            chunk = np.asarray(chunk, dtype=np.float32).reshape(-1)
+            if not np.isfinite(chunk).all():
+                raise RuntimeError('生成的音频无效，请重试。')
+            if not chunk.size:
+                continue
             audio.append(chunk)
             samples += len(chunk)
             steps = timing.get('total_steps_so_far', steps)
             MONITOR.update(phase='generating', audio_seconds=round(samples / rate, 2), steps=steps)
+            if on_chunk:
+                on_chunk(chunk, rate)
         if not audio:
             raise RuntimeError('未生成音频，请调整文字或参考素材后重试。')
         MONITOR.update(phase='saving')
@@ -233,7 +241,7 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(urlparse(self.path).path)
         if path == '/':
             return self.send(200, (ROOT/'studio.html').read_bytes(), 'text/html; charset=utf-8')
-        if path in ('/studio.css', '/studio.js', '/studio-monitor.js'):
+        if path in ('/studio.css', '/studio.js', '/studio-monitor.js', '/studio-stream.js'):
             mime = 'text/css' if path.endswith('.css') else 'text/javascript'
             return self.send(200, (ROOT/path[1:]).read_bytes(), mime + '; charset=utf-8')
         if path == '/status':
@@ -264,6 +272,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, LIBRARY.delete(data.get('file'), data.get('mode', 'trash')))
             if path == '/generate':
                 return self.send(200, generate(data.get('text',''), data.get('reference',''), data.get('ref_text',''), data.get('model','0.6B'), data.get('settings', {})))
+            if path == '/generate/stream':
+                return self.stream_generate(data)
             if path == '/model':
                 action = data.get('action')
                 if action == 'unload':
@@ -283,6 +293,40 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             traceback.print_exc()
             self.send(500, {'error': str(exc)})
+
+    def stream_generate(self, data):
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/x-ndjson; charset=utf-8')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Connection', 'close')
+        self.end_headers()
+        self.close_connection = True
+        connected = True
+
+        def emit(event):
+            nonlocal connected
+            if connected:
+                try:
+                    self.wfile.write((json.dumps(event, ensure_ascii=False) + '\n').encode('utf-8'))
+                    self.wfile.flush()
+                except OSError:
+                    # Finish saving the requested work even if the page closes.
+                    connected = False
+
+        def chunk(audio, rate):
+            emit(dict(type='audio', sample_rate=rate,
+                      pcm=base64.b64encode(audio.astype('<f4').tobytes()).decode('ascii')))
+
+        emit(dict(type='start'))
+        try:
+            result = generate(data.get('text', ''), data.get('reference', ''),
+                              data.get('ref_text', ''), data.get('model', '0.6B'),
+                              data.get('settings', {}), on_chunk=chunk)
+            emit(dict(type='done', result=result))
+        except Exception as exc:
+            if not isinstance(exc, (ValueError, BusyError)):
+                traceback.print_exc()
+            emit(dict(type='error', error=str(exc)))
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True

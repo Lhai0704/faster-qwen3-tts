@@ -9,6 +9,14 @@ models/
 outputs/
 artifacts/
 .commandcode/
+server.pid
+
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
 
 # User voice materials and generated audio
 test-voice/
